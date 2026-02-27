@@ -14,17 +14,21 @@ from src.schemas.files import (
     FileDeleteResponse,
 )
 from src.utils.auth_dependencies import get_current_user_id
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 file_router = APIRouter(prefix='/files', tags=['Files processing'])
 
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
-ALLOWED_EXTENSIONS = {'.pdf', '.txt', '.docx', '.doc', '.xlsx', '.csv', '.json'}
-UPLOAD_DIRECTORY = os.getenv('UPLOAD_DIRECTORY', './uploads')
+ALLOWED_EXTENSIONS = os.getenv("ALLOWED_EXTENSIONS")
+MAX_FILE_SIZE = os.getenv("MAX_FILE_SIZE")
+UPLOAD_DIRECTORY = os.getenv("UPLOAD_DIRECTORY")
 
 
-@file_router.post('/upload', response_model=FileUploadResponse, status_code=status.HTTP_201_CREATED)
+@file_router.port('/upload-single', response_model=FileUploadResponse, status_code=status.HTTP_201_CREATED)
 async def upload_single_file(
-    file: Annotated[UploadFile, File(description="Select a file to upload")],
+    file: Annotated[UploadFile, File(description="Select one file to upload")],
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user_id)
 ):
@@ -33,28 +37,29 @@ async def upload_single_file(
         if file_ext not in ALLOWED_EXTENSIONS:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"File type not allowed. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}"
+                detail=f"File type is not valid, try uploading different extension file"
             )
-
-        content = await file.read()
-        if len(content) > MAX_FILE_SIZE:
+        
+        file_content = await file.read()
+        if len(file_content) > MAX_FILE_SIZE:
             raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE / (1024 * 1024):.0f}MB"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"File size is to big, try uploading file size of 50 MB max"
             )
-
+        
         file_id = str(uuid.uuid4())
         os.makedirs(UPLOAD_DIRECTORY, exist_ok=True)
-        file_path = os.path.join(UPLOAD_DIRECTORY, f"{file_id}{file_ext}")
-
-        with open(file_path, "wb") as f:
-            f.write(content)
+        file_path = os.path.join(UPLOAD_DIRECTORY, f"{file_id}-{file_ext}")
+        
+        with open(file_path, 'w') as f:
+            f.write()
 
         db_file = FileInputModel(
             file_name=file.filename,
             file_id=file_id,
             user_id=user_id
         )
+
         db.add(db_file)
         await db.commit()
         await db.refresh(db_file)
@@ -66,13 +71,10 @@ async def upload_single_file(
             message="File uploaded successfully"
         )
 
-    except HTTPException:
-        raise
     except Exception as e:
-        await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error uploading file: {str(e)}"
+            detail=f"Something went wrong while uploading file, {str(e)}"
         )
 
 

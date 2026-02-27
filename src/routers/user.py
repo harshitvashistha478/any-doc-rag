@@ -95,7 +95,7 @@ async def login(
     return TokenResponse(
         access_token=access_token,
         token_type="bearer",
-        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60  # Convert to seconds
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60 
     )
 
 
