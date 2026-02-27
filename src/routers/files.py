@@ -22,11 +22,11 @@ load_dotenv()
 file_router = APIRouter(prefix='/files', tags=['Files processing'])
 
 ALLOWED_EXTENSIONS = os.getenv("ALLOWED_EXTENSIONS")
-MAX_FILE_SIZE = os.getenv("MAX_FILE_SIZE")
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE"))
 UPLOAD_DIRECTORY = os.getenv("UPLOAD_DIRECTORY")
 
 
-@file_router.port('/upload-single', response_model=FileUploadResponse, status_code=status.HTTP_201_CREATED)
+@file_router.post('/upload-single', response_model=FileUploadResponse, status_code=status.HTTP_201_CREATED)
 async def upload_single_file(
     file: Annotated[UploadFile, File(description="Select one file to upload")],
     db: AsyncSession = Depends(get_db),
