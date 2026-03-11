@@ -1,28 +1,29 @@
 """
-RAG utility — all five high-priority features wired together:
+RAG utility layer.
 
-  Feature 1 & 2 — Per-user document isolation via per-user Milvus collections.
-                  Every user's chunks live in collection `user_<id>`, so no
-                  cross-user leakage is possible at the DB level.
+High-priority features already present
+───────────────────────────────────────
+  Features 1 & 2  Per-user Milvus collections  (user_{id})
+  Feature  3      Conversation memory          (chat_history param)
+  Feature  4      Cross-encoder re-ranking
+  Feature  5      Async indexing-status updates
 
-  Feature 3     — Conversation memory.  generate_answer() accepts chat_history
-                  (list of {role, content} dicts) and injects it into the
-                  prompt so the LLM can handle follow-up questions.
+Medium-priority additions in this file
+───────────────────────────────────────
+  Task 6   stream_answer()   — async generator that yields LLM tokens one by
+                               one so the caller can push them as SSE.
 
-  Feature 4     — Cross-encoder re-ranking.  We fetch 3× the requested k from
-                  Milvus (cheap vector search), then re-score every candidate
-                  with a CrossEncoder (accurate but slower) and keep the top k.
-
-  Feature 5     — Indexing status tracking.  index_file_task() is an async
-                  background coroutine that writes PROCESSING → INDEXED/FAILED
-                  back to Postgres so callers can poll for completion.
+  Task 8   delete_file_vectors() — removes every Milvus chunk that belongs to
+                               a specific (user_id, file_id) pair, called from
+                               the DELETE /files/{file_id} endpoint so nothing
+                               is left behind in the vector store.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import List, Tuple, Dict
+from typing import AsyncIterator, Dict, List, Tuple
 
 from dotenv import load_dotenv
 from langchain_community.document_loaders import UnstructuredFileLoader
@@ -31,6 +32,7 @@ from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_milvus import Milvus
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pymilvus import Collection, connections, utility
 from sentence_transformers import CrossEncoder
 from sqlalchemy import update
 
@@ -47,20 +49,18 @@ RERANKER_MODEL_NAME  = os.getenv("RERANKER_MODEL_NAME", "cross-encoder/ms-marco-
 # ── Shared model instances (loaded once at startup) ───────────────────────────
 llm        = ChatGroq(model=LLM_MODEL_NAME, temperature=0.7)
 embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-reranker   = CrossEncoder(RERANKER_MODEL_NAME)   # Feature 4
+reranker   = CrossEncoder(RERANKER_MODEL_NAME)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature 1 & 2 — Per-user Milvus collection helpers
+# Internal helpers — collection naming & vector store handles
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _collection_name(user_id: int) -> str:
-    """Each user gets their own isolated Milvus collection."""
     return f"user_{user_id}"
 
 
 def _get_vector_store(user_id: int) -> Milvus:
-    """Return a handle to the user's Milvus collection (read-only, no docs added)."""
     return Milvus(
         embedding_function=embeddings,
         collection_name=_collection_name(user_id),
@@ -74,8 +74,8 @@ def _get_vector_store(user_id: int) -> Milvus:
 
 def _load_single_file(file_path: str) -> List[Document]:
     loader = UnstructuredFileLoader(file_path)
-    docs = loader.load()
-    logger.info("Loaded %d document(s) from %s", len(docs), file_path)
+    docs   = loader.load()
+    logger.info("Loaded %d doc(s) from %s", len(docs), file_path)
     return docs
 
 
@@ -85,8 +85,7 @@ def _split_docs(
     chunk_overlap: int = 150,
 ) -> List[Document]:
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap
     )
     chunks = splitter.split_documents(data)
     logger.info("Split into %d chunks", len(chunks))
@@ -99,12 +98,7 @@ def _save_to_user_collection(
     file_id: str,
     file_name: str,
 ) -> None:
-    """
-    Store chunks in the user's private Milvus collection.
-    Each chunk carries metadata so we can cite sources and
-    delete by file_id later.
-    """
-    # Inject source metadata into every chunk
+    """Embed chunks and store them in the user's private Milvus collection."""
     for i, chunk in enumerate(chunks):
         chunk.metadata.update({
             "user_id":   user_id,
@@ -116,43 +110,87 @@ def _save_to_user_collection(
     Milvus.from_documents(
         documents=chunks,
         embedding=embeddings,
-        collection_name=_collection_name(user_id),   # Feature 1 & 2
+        collection_name=_collection_name(user_id),
         connection_args={"uri": MILVUS_URI},
-        drop_old=False,   # append — preserve existing user docs
+        drop_old=False,
     )
     logger.info(
-        "Saved %d chunks to collection '%s' for file_id=%s",
+        "Saved %d chunks to collection '%s' (file_id=%s)",
         len(chunks), _collection_name(user_id), file_id,
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature 4 — Re-ranking
+# Task 8 — Delete vectors from Milvus when a file is deleted
+# ─────────────────────────────────────────────────────────────────────────────
+
+def delete_file_vectors(user_id: int, file_id: str) -> int:
+    """
+    Remove every chunk that belongs to `file_id` from the user's Milvus
+    collection.  Returns the number of entities deleted.
+
+    Strategy
+    ────────
+    We use pymilvus directly because langchain-milvus' high-level API only
+    supports deletion by primary key.  Milvus 2.3+ supports scalar-field
+    expression deletes, which is exactly what we need here.
+
+    If the user's collection doesn't exist yet (edge case: file was uploaded
+    but indexing never ran), we just return 0 safely.
+    """
+    col_name = _collection_name(user_id)
+
+    try:
+        connections.connect(alias="default", uri=MILVUS_URI)
+
+        if not utility.has_collection(col_name):
+            logger.info("Collection '%s' does not exist — nothing to delete.", col_name)
+            return 0
+
+        collection = Collection(col_name)
+        collection.load()
+
+        # Expression filter: match the file_id metadata field
+        expr   = f'file_id == "{file_id}"'
+        result = collection.delete(expr=expr)
+
+        deleted = result.delete_count
+        logger.info(
+            "Deleted %d vector(s) from collection '%s' for file_id='%s'",
+            deleted, col_name, file_id,
+        )
+        return deleted
+
+    except Exception as exc:
+        # Non-fatal: log and continue — the file record will still be removed
+        # from Postgres even if vector cleanup fails.
+        logger.error(
+            "Failed to delete vectors for file_id='%s' in collection '%s': %s",
+            file_id, col_name, exc,
+        )
+        return 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Re-ranking (Feature 4)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _rerank(query: str, docs: List[Document], top_k: int) -> List[Document]:
-    """
-    Score every candidate doc with the CrossEncoder, then return the
-    top_k by descending relevance score.
-    """
     if not docs:
         return []
-
     pairs  = [(query, doc.page_content) for doc in docs]
-    scores = reranker.predict(pairs)                    # shape: (len(docs),)
-
+    scores = reranker.predict(pairs)
     ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
     top    = [doc for _, doc in ranked[:top_k]]
-
     logger.info(
-        "Re-ranked %d candidates → kept top %d  (best score: %.4f)",
+        "Re-ranked %d candidates → kept top %d (best=%.4f)",
         len(docs), len(top), ranked[0][0] if ranked else 0,
     )
     return top
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature 5 — Indexing status tracking (async background task)
+# Feature 5 — Async indexing background task
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def index_file_task(
@@ -162,20 +200,13 @@ async def index_file_task(
     file_name: str,
 ) -> None:
     """
-    Full indexing pipeline run as an async FastAPI BackgroundTask.
-    Opens its own DB session so it can update the file's indexing_status
-    independently of the HTTP request that spawned it.
-
-    Status transitions:
-        PENDING → PROCESSING → INDEXED
-                            ↘ FAILED  (on any exception)
+    Full pipeline: load → split → store in Milvus.
+    Writes PROCESSING → INDEXED / FAILED back to Postgres.
     """
-    # Import here to avoid circular imports at module load time
     from src.database.config import AsyncSessionLocal
     from src.models.files import FileInputModel, IndexingStatus
 
     async with AsyncSessionLocal() as db:
-        # ── Mark as processing ───────────────────────────────────────────────
         await db.execute(
             update(FileInputModel)
             .where(FileInputModel.file_id == file_id)
@@ -188,20 +219,15 @@ async def index_file_task(
             chunks = _split_docs(docs)
             _save_to_user_collection(chunks, user_id, file_id, file_name)
 
-            # ── Mark as indexed ──────────────────────────────────────────────
             await db.execute(
                 update(FileInputModel)
                 .where(FileInputModel.file_id == file_id)
-                .values(
-                    indexing_status=IndexingStatus.INDEXED,
-                    indexing_error=None,
-                )
+                .values(indexing_status=IndexingStatus.INDEXED, indexing_error=None)
             )
             await db.commit()
             logger.info("Indexing complete for file_id=%s", file_id)
 
         except Exception as exc:
-            # ── Mark as failed ───────────────────────────────────────────────
             logger.exception("Indexing failed for file_id=%s", file_id)
             await db.execute(
                 update(FileInputModel)
@@ -215,32 +241,19 @@ async def index_file_task(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public retrieval helpers
+# Retrieval helpers (Features 1, 2, 4)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_relevant_docs(
-    query: str,
-    user_id: int,
-    top_k: int = 4,
-    fetch_k: int = 12,    # fetch 3× more candidates for the re-ranker
-) -> List[Document]:
-    """
-    Retrieve documents from the user's private collection (Feature 1 & 2),
-    then re-rank them with the CrossEncoder (Feature 4).
-    """
-    vs        = _get_vector_store(user_id)
-    retriever = vs.as_retriever(search_kwargs={"k": fetch_k})
-    candidates = retriever.invoke(query)
-    return _rerank(query, candidates, top_k)
-
-
-def get_relevant_docs_with_score(
+def _get_docs_with_scores(
     query: str,
     user_id: int,
     top_k: int = 4,
     fetch_k: int = 12,
 ) -> List[Tuple[Document, float]]:
-    """Same as above but also returns the re-ranker score for each chunk."""
+    """
+    Fetch fetch_k candidates from Milvus, re-rank with CrossEncoder,
+    return top_k with their re-ranker scores.
+    """
     vs         = _get_vector_store(user_id)
     candidates = vs.similarity_search(query, k=fetch_k)
     if not candidates:
@@ -252,8 +265,56 @@ def get_relevant_docs_with_score(
     return [(doc, float(score)) for score, doc in ranked[:top_k]]
 
 
+def _build_context_and_sources(
+    docs_with_scores: List[Tuple[Document, float]],
+) -> Tuple[str, List[Dict]]:
+    """Render a context string and a deduplicated sources list."""
+    context_parts = []
+    sources       = []
+    seen          = set()
+
+    for doc, score in docs_with_scores:
+        meta      = doc.metadata
+        file_name = meta.get("file_name", "unknown")
+        file_id   = meta.get("file_id", "")
+        chunk_idx = meta.get("chunk_idx", 0)
+
+        context_parts.append(
+            f"[Source: {file_name}, chunk {chunk_idx}, score {score:.3f}]\n"
+            f"{doc.page_content}"
+        )
+        key = f"{file_id}:{chunk_idx}"
+        if key not in seen:
+            seen.add(key)
+            sources.append({"file_name": file_name, "file_id": file_id, "chunk_idx": chunk_idx})
+
+    return "\n\n---\n\n".join(context_parts), sources
+
+
+def _build_prompt(
+    query: str,
+    context: str,
+    chat_history: List[Dict[str, str]] | None,
+) -> str:
+    history_block = ""
+    if chat_history:
+        turns = [
+            f"{t.get('role','user').capitalize()}: {t.get('content','')}"
+            for t in chat_history[-6:]
+        ]
+        history_block = "\n\n<Conversation History>\n" + "\n".join(turns) + "\n</Conversation History>"
+
+    return (
+        "You are a helpful assistant that answers questions strictly using the provided context.\n"
+        "If the answer is not found in the context, say so clearly — do not invent information."
+        f"{history_block}\n\n"
+        f"<Context>\n{context}\n</Context>\n\n"
+        f"Question: {query}\n\nAnswer:"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature 3 — Conversation-aware answer generation
+# Public API — non-streaming (Feature 3 + all above)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def generate_answer(
@@ -262,86 +323,72 @@ def generate_answer(
     chat_history: List[Dict[str, str]] | None = None,
 ) -> Dict:
     """
-    Full RAG pipeline with conversation memory and source citations.
-
-    Args:
-        query:        Current user question.
-        user_id:      Used to scope retrieval to the user's own documents.
-        chat_history: List of {"role": "user"|"assistant", "content": "..."}
-                      dicts representing previous turns in this session.
+    Full RAG pipeline (non-streaming).
 
     Returns:
-        {
-            "answer":  str,
-            "sources": [{"file_name": str, "file_id": str, "chunk_idx": int}, ...]
-        }
+        {"answer": str, "sources": [{"file_name", "file_id", "chunk_idx"}, ...]}
     """
-    # ── Retrieve & re-rank ────────────────────────────────────────────────────
-    docs_with_scores = get_relevant_docs_with_score(query, user_id)
+    docs_with_scores = _get_docs_with_scores(query, user_id)
 
     if not docs_with_scores:
         return {
-            "answer": (
-                "I could not find any relevant information in your documents "
-                "to answer this question."
-            ),
+            "answer": "I could not find relevant information in your documents to answer this question.",
             "sources": [],
         }
 
-    # ── Build context block with inline source tags ───────────────────────────
-    context_parts = []
-    sources       = []
-    seen_sources  = set()
+    context, sources = _build_context_and_sources(docs_with_scores)
+    prompt           = _build_prompt(query, context, chat_history)
+    response         = llm.invoke(prompt)
 
-    for doc, score in docs_with_scores:
-        meta       = doc.metadata
-        file_name  = meta.get("file_name", "unknown")
-        file_id    = meta.get("file_id", "")
-        chunk_idx  = meta.get("chunk_idx", 0)
+    return {"answer": response.content, "sources": sources}
 
-        context_parts.append(
-            f"[Source: {file_name}, chunk {chunk_idx}, score {score:.3f}]\n"
-            f"{doc.page_content}"
-        )
 
-        source_key = f"{file_id}:{chunk_idx}"
-        if source_key not in seen_sources:
-            seen_sources.add(source_key)
-            sources.append({
-                "file_name": file_name,
-                "file_id":   file_id,
-                "chunk_idx": chunk_idx,
-            })
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 6 — Streaming answer
+# ─────────────────────────────────────────────────────────────────────────────
 
-    context = "\n\n---\n\n".join(context_parts)
+async def stream_answer(
+    query: str,
+    user_id: int,
+    chat_history: List[Dict[str, str]] | None = None,
+) -> AsyncIterator[str]:
+    """
+    Streaming RAG pipeline.
 
-    # ── Build history block ───────────────────────────────────────────────────
-    # Feature 3: inject prior turns so the LLM can handle follow-up questions
-    history_block = ""
-    if chat_history:
-        turns = []
-        for turn in chat_history[-6:]:   # cap at last 6 turns to stay within context window
-            role    = turn.get("role", "user").capitalize()
-            content = turn.get("content", "")
-            turns.append(f"{role}: {content}")
-        history_block = "\n\n<Conversation History>\n" + "\n".join(turns) + "\n</Conversation History>"
+    Yields Server-Sent Event lines:
+      - One  "data: <token>\\n\\n"  per LLM token as it arrives.
+      - A final "data: [SOURCES] <json>\\n\\n" so the client knows which
+        documents were cited.
+      - A terminal "data: [DONE]\\n\\n" to signal end-of-stream.
 
-    # ── Compose final prompt ──────────────────────────────────────────────────
-    prompt = f"""You are a helpful assistant that answers questions strictly using the provided context.
-If the answer is not found in the context, say so clearly — do not invent information.
-{history_block}
+    Example client consumption (JavaScript):
+        const es = new EventSource('/rag/stream?...');
+        es.onmessage = (e) => {
+            if (e.data === '[DONE]') { es.close(); return; }
+            if (e.data.startsWith('[SOURCES]')) { /* parse citations */ return; }
+            appendToken(e.data);
+        };
+    """
+    import json
 
-<Context>
-{context}
-</Context>
+    # ── Retrieval (sync, fast) ────────────────────────────────────────────────
+    docs_with_scores = _get_docs_with_scores(query, user_id)
 
-Question: {query}
+    if not docs_with_scores:
+        yield "data: I could not find relevant information in your documents.\n\n"
+        yield "data: [DONE]\n\n"
+        return
 
-Answer:"""
+    context, sources = _build_context_and_sources(docs_with_scores)
+    prompt           = _build_prompt(query, context, chat_history)
 
-    response = llm.invoke(prompt)
+    # ── Stream tokens from LLM ────────────────────────────────────────────────
+    async for chunk in llm.astream(prompt):
+        token = chunk.content
+        if token:
+            # Escape newlines inside the SSE data field
+            yield f"data: {token.replace(chr(10), ' ')}\n\n"
 
-    return {
-        "answer":  response.content,
-        "sources": sources,
-    }
+    # ── Send sources after all tokens ─────────────────────────────────────────
+    yield f"data: [SOURCES] {json.dumps(sources)}\n\n"
+    yield "data: [DONE]\n\n"

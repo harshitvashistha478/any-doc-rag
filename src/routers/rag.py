@@ -1,35 +1,41 @@
 """
-RAG router — Feature 3 (conversation memory) exposed as REST endpoints.
+RAG router
 
-Endpoints
-─────────
-POST /rag/sessions                       Create a new chat session
-GET  /rag/sessions                       List all sessions for the current user
-GET  /rag/sessions/{id}                  Get a session + its full message history
-DELETE /rag/sessions/{id}                Delete session and all its messages
+Medium-priority additions
+──────────────────────────
+  Task 6   POST /rag/stream                    — stateless streaming query
+           POST /rag/sessions/{id}/stream      — session-aware streaming query
 
-POST /rag/sessions/{id}/query            Ask a question inside a session
-                                         (history is loaded automatically)
+Both streaming endpoints use FastAPI's StreamingResponse with Server-Sent Events
+(SSE).  The LLM tokens stream in real-time; sources arrive in a final event
+before the [DONE] sentinel.
 
-POST /rag/query                          Stateless one-off query (no session)
+SSE event format
+────────────────
+  data: <token text>\\n\\n          — one per LLM token
+  data: [SOURCES] <json array>\\n\\n — citations, sent after all tokens
+  data: [DONE]\\n\\n                 — signals end of stream
 """
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List, Optional
+from typing import AsyncIterator, List
 
 from src.database.config import get_db
-from src.models.chat import ChatSession, ChatMessage, MessageRole
-from src.utils.auth_dependencies import get_current_user_id
-from src.utils.rag import generate_answer
+from src.models.chat import ChatMessage, ChatSession, MessageRole
+from src.utils.auth_dependencies import get_current_user, get_current_user_id
+from src.utils.rag import generate_answer, stream_answer
 
 rag_router = APIRouter(prefix="/rag", tags=["RAG"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pydantic schemas  (kept here since they're router-specific)
+# Schemas
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SourceSchema(BaseModel):
@@ -77,7 +83,7 @@ class SessionQueryRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _get_owned_session(
@@ -100,8 +106,17 @@ async def _get_owned_session(
     return session
 
 
+async def _load_history(session_id: int, db: AsyncSession) -> list[dict]:
+    result = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == session_id)
+        .order_by(ChatMessage.id)
+    )
+    return [{"role": m.role.value, "content": m.content} for m in result.scalars().all()]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature 3 — Session management
+# Session management  (Feature 3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @rag_router.post("/sessions", response_model=SessionSchema, status_code=status.HTTP_201_CREATED)
@@ -110,7 +125,6 @@ async def create_session(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ):
-    """Create a new named chat session."""
     session = ChatSession(user_id=user_id, title=body.title)
     db.add(session)
     await db.commit()
@@ -123,7 +137,6 @@ async def list_sessions(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ):
-    """List all chat sessions for the current user (newest first)."""
     result = await db.execute(
         select(ChatSession)
         .where(ChatSession.user_id == user_id)
@@ -138,11 +151,8 @@ async def get_session(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ):
-    """Get a session and its full message history."""
     session = await _get_owned_session(session_id, user_id, db)
-
-    # Eagerly load messages
-    result = await db.execute(
+    result  = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == session_id)
         .order_by(ChatMessage.id)
@@ -157,14 +167,13 @@ async def delete_session(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ):
-    """Delete a session and all its messages (cascade)."""
     session = await _get_owned_session(session_id, user_id, db)
     await db.delete(session)
     await db.commit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feature 3 — Multi-turn query inside a session
+# Non-streaming queries
 # ─────────────────────────────────────────────────────────────────────────────
 
 @rag_router.post("/sessions/{session_id}/query", response_model=RAGQueryResponse)
@@ -174,37 +183,15 @@ async def session_query(
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ):
-    """
-    Ask a question inside a session.
-
-    - The full message history of the session is loaded and passed to the LLM
-      so it can resolve pronouns and handle follow-up questions.
-    - Both the user turn and the assistant response are saved back to the DB
-      so the next query in this session will see them.
-    """
+    """Multi-turn query — loads history, answers, persists both turns."""
     await _get_owned_session(session_id, user_id, db)
+    history = await _load_history(session_id, db)
 
-    # Load existing messages to build history
-    result = await db.execute(
-        select(ChatMessage)
-        .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.id)
-    )
-    messages = result.scalars().all()
-    history  = [{"role": m.role.value, "content": m.content} for m in messages]
-
-    # Generate answer with full history (Feature 3) + per-user retrieval (Feature 1&2)
-    # + re-ranking (Feature 4) — all inside generate_answer()
     try:
-        result_data = generate_answer(
-            query=body.query,
-            user_id=user_id,
-            chat_history=history,
-        )
+        result_data = generate_answer(query=body.query, user_id=user_id, chat_history=history)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"RAG error: {e}")
 
-    # Persist both turns to the session
     db.add(ChatMessage(session_id=session_id, role=MessageRole.USER,      content=body.query))
     db.add(ChatMessage(session_id=session_id, role=MessageRole.ASSISTANT, content=result_data["answer"]))
     await db.commit()
@@ -217,25 +204,14 @@ async def session_query(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stateless one-off query (no session needed)
-# ─────────────────────────────────────────────────────────────────────────────
-
 @rag_router.post("/query", response_model=RAGQueryResponse)
 async def stateless_query(
     body: RAGQueryRequest,
     user_id: int = Depends(get_current_user_id),
 ):
-    """
-    Quick one-off query — no session, no history.
-    Good for single questions; use /sessions/{id}/query for conversations.
-    """
+    """One-off query with no session history."""
     try:
-        result_data = generate_answer(
-            query=body.query,
-            user_id=user_id,
-            chat_history=None,
-        )
+        result_data = generate_answer(query=body.query, user_id=user_id, chat_history=None)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"RAG error: {e}")
 
@@ -244,4 +220,110 @@ async def stateless_query(
         query=body.query,
         answer=result_data["answer"],
         sources=[SourceSchema(**s) for s in result_data["sources"]],
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 6 — Streaming endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+@rag_router.post("/stream")
+async def stateless_stream(
+    body: RAGQueryRequest,
+    user_id: int = Depends(get_current_user_id),
+):
+    """
+    Stateless streaming query.  Returns tokens as Server-Sent Events.
+
+    SSE protocol:
+      data: <token>\\n\\n
+      data: [SOURCES] [{"file_name":..., "file_id":..., "chunk_idx":...}, ...]\\n\\n
+      data: [DONE]\\n\\n
+    """
+    async def event_generator() -> AsyncIterator[str]:
+        async for chunk in stream_answer(
+            query=body.query,
+            user_id=user_id,
+            chat_history=None,
+        ):
+            yield chunk
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            # Disable buffering so tokens arrive at the client in real-time
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@rag_router.post("/sessions/{session_id}/stream")
+async def session_stream(
+    session_id: int,
+    body: SessionQueryRequest,
+    db: AsyncSession = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+):
+    """
+    Session-aware streaming query.
+
+    - Loads the full conversation history before streaming.
+    - After the stream is exhausted, persists both turns to the DB so the
+      next query in this session sees them.
+
+    SSE protocol: same as /rag/stream
+    """
+    await _get_owned_session(session_id, user_id, db)
+    history = await _load_history(session_id, db)
+
+    # Collect the full answer while streaming so we can persist it afterward
+    answer_parts: list[str] = []
+    sources_data: list[dict] = []
+
+    async def event_generator() -> AsyncIterator[str]:
+        async for chunk in stream_answer(
+            query=body.query,
+            user_id=user_id,
+            chat_history=history,
+        ):
+            # Intercept the [SOURCES] event to capture citation data
+            if chunk.startswith("data: [SOURCES]"):
+                try:
+                    payload = chunk.removeprefix("data: [SOURCES] ").strip()
+                    sources_data.extend(json.loads(payload))
+                except Exception:
+                    pass
+            elif chunk.startswith("data: [DONE]"):
+                # Persist both turns once streaming is complete
+                full_answer = "".join(answer_parts)
+                db.add(ChatMessage(
+                    session_id=session_id,
+                    role=MessageRole.USER,
+                    content=body.query,
+                ))
+                db.add(ChatMessage(
+                    session_id=session_id,
+                    role=MessageRole.ASSISTANT,
+                    content=full_answer,
+                ))
+                try:
+                    await db.commit()
+                except Exception:
+                    await db.rollback()
+            elif not chunk.startswith("data: ["):
+                # Regular token — strip the "data: " prefix and collect
+                token = chunk.removeprefix("data: ").rstrip("\n")
+                answer_parts.append(token)
+
+            yield chunk
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
