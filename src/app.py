@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from src.database import init_db
 from src.routers.user import user_router
 from src.routers.files import file_router
+from src.routers.rag import rag_router
 import os
 from dotenv import load_dotenv
 
@@ -24,6 +25,7 @@ app.add_middleware(
 
 app.include_router(user_router)
 app.include_router(file_router)
+app.include_router(rag_router)
 
 @app.on_event("startup")
 async def on_startup():
